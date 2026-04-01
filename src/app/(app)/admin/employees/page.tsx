@@ -1,3 +1,2 @@
-export default function EmployeeListPage() {
-  return <p>Employee list — coming soon</p>;
-}
+import { redirect } from "next/navigation";
+export default function EmployeesPage() { redirect("/admin"); }
