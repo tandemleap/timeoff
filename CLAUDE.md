@@ -139,12 +139,12 @@ Three tables, all with RLS enabled. Schema file: `supabase/schema.sql`.
 
 ```
 NEXT_PUBLIC_SUPABASE_URL=https://bwxraqhsdxwzcmooikli.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=sb_publishable_...   # Supabase "publishable" key
-SUPABASE_SERVICE_ROLE_KEY=sb_secret_...            # Supabase "secret" key
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=sb_publishable_...   # Supabase publishable key
+SUPABASE_SERVICE_ROLE_KEY=sb_secret_...                           # Supabase secret key
 ```
 
-Supabase now uses `sb_publishable_*` (replaces anon key) and `sb_secret_*` (replaces service_role key).
-The env var names in `@supabase/ssr` remain the same — only the values changed format.
+Supabase renamed keys: `sb_publishable_*` (replaces anon key), `sb_secret_*` (replaces service_role key).
+The env var `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY` replaces the old `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
 
 `.env.local` is gitignored and contains the real values.
 `.env.example` contains placeholders for reference.
