@@ -7,6 +7,7 @@
 const assert = require("assert");
 const {
   createEmployee,
+  setOpeningBalance,
   setEmployeeHours,
   computeEmployeePTO,
   usePTO,
@@ -153,7 +154,7 @@ test("one full year @ 20 hrs/week, 0 years service ≈ correct accrual", () => {
   const expected = weeks * 20 * (150 / 2080);
   const result   = computeEmployeePTO(emp, "2025-01-01");
 
-  assertClose(result.totalAccrued, expected, 0.01, "1yr@20hr ");
+  assertClose(result.accruedSinceOpening, expected, 0.01, "1yr@20hr ");
 });
 
 test("full-time equivalent: 40 hrs/week for one year earns PTO proportional to actual weeks", () => {
@@ -164,20 +165,20 @@ test("full-time equivalent: 40 hrs/week for one year earns PTO proportional to a
   const weeks    = (new Date("2025-01-01") - new Date("2024-01-01")) / (7 * 24 * 3600 * 1000);
   const expected = weeks * 40 * (150 / 2080);
   const result   = computeEmployeePTO(emp, "2025-01-01");
-  assertClose(result.totalAccrued, expected, 0.01, "FT 1yr ");
+  assertClose(result.accruedSinceOpening, expected, 0.01, "FT 1yr ");
 });
 
 test("zero hours → zero accrual", () => {
   const emp = createEmployee("e1", "Jane", "2024-01-01");
   setEmployeeHours(emp, "2024-01-01", 0);
   const result = computeEmployeePTO(emp, "2025-01-01");
-  assert.strictEqual(result.totalAccrued, 0);
+  assert.strictEqual(result.accruedSinceOpening, 0);
 });
 
 test("no hoursHistory → zero accrual", () => {
   const emp = createEmployee("e1", "Jane", "2024-01-01");
   const result = computeEmployeePTO(emp, "2025-01-01");
-  assert.strictEqual(result.totalAccrued, 0);
+  assert.strictEqual(result.accruedSinceOpening, 0);
 });
 
 test("90-day eligibility flag is correct (before 90 days)", () => {
@@ -221,7 +222,7 @@ test("hours update on anniversary splits correctly into two segments", () => {
   const weeks2      = (new Date("2026-01-01") - new Date("2025-01-01")) / MS_PER_WEEK;
   const expected    = (weeks1 * 20 + weeks2 * 30) * rate;
 
-  assertClose(result.totalAccrued, expected, 0.01, "2yr split ");
+  assertClose(result.accruedSinceOpening, expected, 0.01, "2yr split ");
   assert.strictEqual(result.segments.length, 2);
 });
 
@@ -299,7 +300,7 @@ test("balance reflects usage", () => {
   setEmployeeHours(emp, "2024-01-01", 20);
   usePTO(emp, 5, "2025-01-01");
   const result = computeEmployeePTO(emp, "2025-01-01");
-  assertClose(result.balance, result.totalAccrued - 5, 0.001, "balance after use ");
+  assertClose(result.balance, result.accruedSinceOpening - 5, 0.001, "balance after use ");
 });
 test("throws if not yet eligible", () => {
   const emp = createEmployee("e1", "Jane", "2025-01-01");
@@ -337,6 +338,130 @@ test("after 1 year, yearsCompleted = 1, next = 2nd anniversary", () => {
   const summary = getAnniversarySummary(emp, "2025-06-01");
   assert.strictEqual(summary.yearsCompleted, 1);
   assert.strictEqual(summary.nextAnniversary, "2026-01-01");
+});
+
+// ---------------------------------------------------------------------------
+// setOpeningBalance
+// ---------------------------------------------------------------------------
+console.log("\nsetOpeningBalance");
+
+test("stores openingBalance on employee and resets ptoUsed", () => {
+  const emp = createEmployee("e1", "Jane", "2021-01-01");
+  emp.ptoUsed = 5; // simulate prior usage before calling setOpeningBalance
+  setOpeningBalance(emp, "2026-04-01", 12.5);
+  assert.deepStrictEqual(emp.openingBalance, { asOfDate: "2026-04-01", hours: 12.5 });
+  assert.strictEqual(emp.ptoUsed, 0); // reset — usage tracked from opening date forward
+});
+test("throws if asOfDate before hireDate", () => {
+  const emp = createEmployee("e1", "Jane", "2024-06-01");
+  assert.throws(() => setOpeningBalance(emp, "2023-01-01", 10), /before hireDate/);
+});
+test("throws on negative hours", () => {
+  const emp = createEmployee("e1", "Jane", "2024-01-01");
+  assert.throws(() => setOpeningBalance(emp, "2024-01-01", -1), /non-negative/);
+});
+test("allows zero balance (employee has used all PTO)", () => {
+  const emp = createEmployee("e1", "Jane", "2024-01-01");
+  setOpeningBalance(emp, "2026-04-01", 0);
+  assert.strictEqual(emp.openingBalance.hours, 0);
+});
+
+// ---------------------------------------------------------------------------
+// computeEmployeePTO — opening balance (imported employee)
+// ---------------------------------------------------------------------------
+console.log("\ncomputeEmployeePTO — opening balance");
+
+test("balance starts from opening balance hours when no time has passed", () => {
+  const emp = createEmployee("e1", "Jane", "2021-01-01");
+  setOpeningBalance(emp, "2026-04-01", 18.5);
+  setEmployeeHours(emp, "2026-04-01", 20);
+
+  // Query exactly on the opening balance date → 0 additional accrual
+  const result = computeEmployeePTO(emp, "2026-04-01");
+  assert.strictEqual(result.accruedSinceOpening, 0);
+  assert.strictEqual(result.balance, 18.5);
+});
+
+test("accrual adds on top of opening balance going forward", () => {
+  // Hired 2021-01-01, 5 years of service by opening date 2026-01-01.
+  // At 5 years the rate is 190/2080.
+  const emp = createEmployee("e1", "Jane", "2021-01-01");
+  setOpeningBalance(emp, "2026-01-01", 10);
+  setEmployeeHours(emp, "2026-01-01", 20);
+
+  // Compute 26 weeks later (roughly half a year)
+  const result = computeEmployeePTO(emp, "2026-07-01");
+  const MS_PER_WEEK = 7 * 24 * 3600 * 1000;
+  const weeks       = (new Date("2026-07-01") - new Date("2026-01-01")) / MS_PER_WEEK;
+  const expectedNew = weeks * 20 * (190 / 2080);
+
+  assertClose(result.accruedSinceOpening, expectedNew, 0.05, "accrued since opening ");
+  assertClose(result.balance, 10 + expectedNew, 0.05, "balance ");
+});
+
+test("ptoUsed after opening is subtracted from balance", () => {
+  const emp = createEmployee("e1", "Jane", "2021-01-01");
+  setOpeningBalance(emp, "2026-01-01", 10);
+  setEmployeeHours(emp, "2026-01-01", 20);
+
+  // Use 5 hours after opening
+  usePTO(emp, 5, "2026-07-01");
+
+  const result = computeEmployeePTO(emp, "2026-07-01");
+  const MS_PER_WEEK = 7 * 24 * 3600 * 1000;
+  const weeks       = (new Date("2026-07-01") - new Date("2026-01-01")) / MS_PER_WEEK;
+  const expectedNew = weeks * 20 * (190 / 2080);
+
+  assertClose(result.balance, 10 + expectedNew - 5, 0.05, "balance after use ");
+  assert.strictEqual(result.ptoUsed, 5);
+});
+
+test("hireDate is still used for years-of-service tier (not opening balance date)", () => {
+  // Hired exactly 5 years before opening balance date → should use 190/2080 rate
+  const emp = createEmployee("e1", "Jane", "2021-01-01");
+  setOpeningBalance(emp, "2026-01-01", 0); // 5yr anniversary = opening date
+  setEmployeeHours(emp, "2026-01-01", 20);
+
+  const result = computeEmployeePTO(emp, "2026-07-01");
+  const seg    = result.segments[0];
+  assertClose(seg.accrualRate, 190 / 2080, 1e-6, "5yr rate ");
+  assert.strictEqual(seg.yearsOfService, 5);
+});
+
+test("opening balance date before asOfDate but after hireDate shows accrual from opening date only", () => {
+  // Hired 2020-01-01, opening balance set 2026-04-01.
+  // Accrual should NOT cover 2020-2026 in segments.
+  const emp = createEmployee("e1", "Jane", "2020-01-01");
+  setOpeningBalance(emp, "2026-04-01", 5);
+  setEmployeeHours(emp, "2026-04-01", 20);
+
+  const result = computeEmployeePTO(emp, "2027-04-01");
+
+  // Segments should only cover 2026-04-01 → 2027-04-01
+  assert.ok(result.segments.every(s => s.start >= "2026-04-01"), "No segment before opening date");
+  assert.ok(result.accruedSinceOpening > 0, "Should have accrued some PTO");
+});
+
+test("asOfDate before openingBalance.asOfDate returns opening balance unchanged", () => {
+  const emp = createEmployee("e1", "Jane", "2020-01-01");
+  setOpeningBalance(emp, "2026-04-01", 15);
+  setEmployeeHours(emp, "2026-04-01", 20);
+
+  // Query a date before the opening balance snapshot
+  const result = computeEmployeePTO(emp, "2025-01-01");
+  assert.strictEqual(result.accruedSinceOpening, 0);
+  assert.strictEqual(result.balance, 15);
+  assert.deepStrictEqual(result.segments, []);
+});
+
+test("new employee (no openingBalance) behaves as before — no regression", () => {
+  const emp = createEmployee("e1", "Jane", "2024-01-01");
+  setEmployeeHours(emp, "2024-01-01", 20);
+  const result = computeEmployeePTO(emp, "2025-01-01");
+
+  assert.strictEqual(result.openingBalance, null);
+  assert.ok(result.accruedSinceOpening > 0);
+  assert.strictEqual(result.balance, result.accruedSinceOpening); // no ptoUsed
 });
 
 // ---------------------------------------------------------------------------

@@ -6,9 +6,10 @@
  *   accounting for:
  *     - Changes in average weekly hours (entered after 90 days, updatable on anniversary)
  *     - Vacation tier upgrades that occur at whole-year tenure milestones
+ *     - Pre-existing employees imported at app launch via an opening balance
  *
  * HOW SEGMENTED ACCRUAL WORKS:
- *   An employee's timeline from hire to "today" is divided into segments.
+ *   An employee's timeline is divided into segments.
  *   A new segment begins whenever EITHER of the following changes:
  *     1. The employee's average weekly hours are updated (hoursHistory entry)
  *     2. The employee crosses a vacation-tier anniversary (years 5, 6, 7 … 18)
@@ -21,23 +22,47 @@
  *
  *   Total PTO accrued = sum of ptoEarned across all segments.
  *
+ * OPENING BALANCE (for pre-existing employees):
+ *   When the app launches, employees hired before launch already have a PTO
+ *   history. Rather than reconstructing all past hours, the admin provides a
+ *   snapshot via setOpeningBalance():
+ *
+ *     openingBalance: {
+ *       asOfDate: string,   — the date the snapshot was taken (typically app launch date)
+ *       hours:    number,   — net PTO balance on that date (accrued − already used)
+ *     }
+ *
+ *   How it changes the calculation:
+ *     - Accrual is computed ONLY from openingBalance.asOfDate forward (not from hireDate).
+ *     - hireDate is still stored and used for yearsOfService / vacation-tier calculations.
+ *     - ptoUsed tracks only usage AFTER openingBalance.asOfDate.
+ *     - Final balance = openingBalance.hours + accruedSinceOpening − ptoUsedAfterOpening
+ *
+ *   For newly hired employees (hired after app launch), simply omit setOpeningBalance().
+ *   The system will calculate from hireDate as normal.
+ *
  * EMPLOYEE DATA SHAPE:
  *   {
- *     id:           string,    — unique identifier
- *     name:         string,
- *     hireDate:     string,    — ISO date string, e.g. "2024-03-15"
- *     hoursHistory: [          — sorted ascending by effectiveDate
+ *     id:             string,
+ *     name:           string,
+ *     hireDate:       string,    — ISO date. Used for tenure / tier only when openingBalance is set.
+ *     openingBalance: {          — null for employees hired after app launch
+ *       asOfDate:     string,    — ISO date of the snapshot
+ *       hours:        number,    — net PTO balance (accrued − used) as of that date
+ *     } | null,
+ *     hoursHistory:   [          — sorted ascending by effectiveDate
  *       { effectiveDate: string, avgHoursPerWeek: number }
  *     ],
- *     ptoUsed:      number,    — cumulative PTO hours used to date
+ *     ptoUsed:        number,    — hours used AFTER openingBalance.asOfDate (or hireDate if no opening balance)
  *   }
  *
  * HOURS HISTORY NOTES:
- *   - The first entry is applied RETROACTIVELY to hireDate, so PTO accrues
- *     from day one even before the admin formally enters the hours.
- *   - Subsequent entries take effect on their effectiveDate (typically an
- *     anniversary date or whenever the schedule changes).
- *   - If hoursHistory is empty, accrual returns 0 (no hours on record).
+ *   - For new employees: the first entry is applied RETROACTIVELY to hireDate.
+ *   - For imported employees: only entries at or after openingBalance.asOfDate
+ *     matter for forward accrual. The first entry covering that date is
+ *     applied retroactively to openingBalance.asOfDate.
+ *   - Subsequent entries take effect on their effectiveDate.
+ *   - If no applicable hoursHistory entry exists, accrual returns 0.
  */
 
 const {
@@ -100,10 +125,65 @@ function createEmployee(id, name, hireDate) {
   return {
     id,
     name,
-    hireDate,          // stored as ISO string; convert to Date when calculating
-    hoursHistory: [],  // populated via setEmployeeHours()
-    ptoUsed: 0,
+    hireDate,           // stored as ISO string; convert to Date when calculating
+    openingBalance: null, // set via setOpeningBalance() for pre-existing employees
+    hoursHistory: [],   // populated via setEmployeeHours()
+    ptoUsed: 0,         // hours used after openingBalance.asOfDate (or hireDate if no opening balance)
   };
+}
+
+// ---------------------------------------------------------------------------
+// OPENING BALANCE (for employees imported at app launch)
+// ---------------------------------------------------------------------------
+
+/**
+ * Records a known PTO balance as of a specific date for an employee who was
+ * hired before the app launched.
+ *
+ * After calling this, the system will:
+ *   - Begin accrual calculations from asOfDate (not hireDate).
+ *   - Use hireDate only to determine years-of-service for vacation-tier lookups.
+ *   - Carry the provided hours forward as the starting balance.
+ *
+ * The admin should also call setEmployeeHours() with an effectiveDate at or
+ * before asOfDate so the system knows how many hours/week to accrue going forward.
+ *
+ * @param {object} employee    — Employee record (mutated in place).
+ * @param {string} asOfDate    — ISO date string. Must be >= hireDate.
+ * @param {number} hours       — Net PTO balance (accrued − already used) on asOfDate.
+ *                               May be 0 if the employee has used all their PTO.
+ * @returns {object} The updated employee record.
+ *
+ * @example
+ *   // App launches 2026-04-01. Jane was hired 2023-06-15 and has 12.5 hrs PTO.
+ *   const emp = createEmployee("e1", "Jane", "2023-06-15");
+ *   setOpeningBalance(emp, "2026-04-01", 12.5);
+ *   setEmployeeHours(emp,  "2026-04-01", 20);   // going-forward schedule
+ */
+function setOpeningBalance(employee, asOfDate, hours) {
+  if (typeof hours !== "number" || hours < 0) {
+    throw new Error(
+      `Opening balance hours must be a non-negative number. Received: ${hours}`
+    );
+  }
+  const asOf     = new Date(asOfDate);
+  const hireDate = new Date(employee.hireDate);
+
+  if (isNaN(asOf.getTime())) {
+    throw new Error(`Invalid asOfDate: ${asOfDate}`);
+  }
+  if (asOf < hireDate) {
+    throw new Error(
+      `Opening balance asOfDate (${asOfDate}) cannot be before hireDate (${employee.hireDate}).`
+    );
+  }
+
+  employee.openingBalance = { asOfDate, hours };
+
+  // Reset ptoUsed — it only tracks usage after the opening balance date.
+  employee.ptoUsed = 0;
+
+  return employee;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,11 +208,14 @@ function createEmployee(id, name, hireDate) {
  * @returns {object} The updated employee record.
  *
  * @example
- *   // Set initial hours (retroactively covers from hire date)
+ *   // New employee — set initial hours (retroactively covers from hire date)
  *   setEmployeeHours(emp, emp.hireDate, 20);
  *
- *   // Update hours on 1-year anniversary
- *   setEmployeeHours(emp, "2025-03-15", 24);
+ *   // Imported employee — set hours as of app launch date
+ *   setEmployeeHours(emp, "2026-04-01", 20);
+ *
+ *   // Update hours on anniversary
+ *   setEmployeeHours(emp, "2027-03-15", 24);
  */
 function setEmployeeHours(employee, effectiveDate, avgHoursPerWeek) {
   if (typeof avgHoursPerWeek !== "number" || avgHoursPerWeek < 0) {
@@ -279,27 +362,49 @@ function buildSegments(hireDate, hoursHistory, boundaries) {
 // ---------------------------------------------------------------------------
 
 /**
- * Computes total PTO accrued for an employee from hireDate through asOfDate.
+ * Computes an employee's current PTO balance.
  *
- * This is the primary calculation function for the employee engine.
- * It delegates per-segment math to calculatePTOAccrual() from pto_calculator.js.
+ * Handles two cases:
+ *
+ * 1. NEW EMPLOYEE (no openingBalance):
+ *    Accrual starts from hireDate. All history is calculated from scratch.
+ *    balance = accruedFromHire − ptoUsed
+ *
+ * 2. IMPORTED EMPLOYEE (openingBalance set):
+ *    Accrual starts from openingBalance.asOfDate. hireDate is used only for
+ *    tenure / vacation-tier calculations.
+ *    balance = openingBalance.hours + accruedSinceOpening − ptoUsedAfterOpening
  *
  * @param {object}      employee
  * @param {Date|string} [asOfDate=new Date()]
  * @returns {{
- *   totalAccrued:   number,   — cumulative PTO hours earned (all time)
- *   ptoUsed:        number,   — cumulative PTO hours drawn down
- *   balance:        number,   — accrued − used (floored at 0)
- *   eligible:       boolean,  — whether employee may USE PTO yet (90-day check)
- *   daysUntilEligible: number,
- *   segments:       object[], — per-segment breakdown for transparency/audit
+ *   employeeId:          string,
+ *   employeeName:        string,
+ *   hireDate:            string,
+ *   asOfDate:            string,
+ *   openingBalance:      { asOfDate: string, hours: number } | null,
+ *   accruedSinceOpening: number,   — PTO earned from accrual start to asOfDate
+ *   ptoUsed:             number,   — hours used after accrual start
+ *   balance:             number,   — final spendable balance (≥ 0)
+ *   eligible:            boolean,  — whether 90-day wait is satisfied
+ *   daysUntilEligible:   number,
+ *   segments:            object[], — per-segment breakdown for audit/display
  * }}
  *
  * @example
+ *   // New employee:
  *   const emp = createEmployee("e1", "Jane", "2024-01-01");
  *   setEmployeeHours(emp, "2024-01-01", 20);
- *   const result = computeEmployeePTO(emp, "2025-01-01");
- *   // result.totalAccrued ≈ (52 weeks × 20 hrs) × (150/2080) ≈ 74.9 hrs
+ *   computeEmployeePTO(emp, "2025-01-01");
+ *   // accruedSinceOpening ≈ 75.4, balance ≈ 75.4
+ *
+ *   // Imported employee:
+ *   const emp2 = createEmployee("e2", "Bob", "2021-06-01");
+ *   setOpeningBalance(emp2, "2026-04-01", 18.5);
+ *   setEmployeeHours(emp2, "2026-04-01", 24);
+ *   computeEmployeePTO(emp2, "2026-10-01");
+ *   // accruedSinceOpening = ~26 weeks × 24 hrs × rate
+ *   // balance = 18.5 + accruedSinceOpening − ptoUsed
  */
 function computeEmployeePTO(employee, asOfDate = new Date()) {
   const hire  = new Date(employee.hireDate);
@@ -309,19 +414,43 @@ function computeEmployeePTO(employee, asOfDate = new Date()) {
   if (isNaN(asOf.getTime()))  throw new Error(`Invalid asOfDate: ${asOfDate}`);
   if (asOf < hire)            throw new Error("asOfDate cannot be before hireDate.");
 
-  // Eligibility (gates USAGE, not accrual)
+  // Eligibility check always uses hireDate (regardless of opening balance).
   const eligibility = isPTOEligible(hire, asOf);
 
-  // Build timeline and compute per-segment accrual
-  const boundaries = buildSegmentBoundaries(hire, employee.hoursHistory, asOf);
-  const segments   = buildSegments(hire, employee.hoursHistory, boundaries);
+  // Determine the start of the accrual window.
+  // For imported employees this is openingBalance.asOfDate; for new employees it is hireDate.
+  const ob            = employee.openingBalance;
+  const accrualStart  = ob ? new Date(ob.asOfDate) : hire;
+  const openingHours  = ob ? ob.hours : 0;
 
-  let totalAccrued = 0;
-  const segmentDetails = segments.map((seg) => {
+  if (asOf < accrualStart) {
+    // asOfDate is before the opening balance snapshot — nothing to accrue yet.
+    return {
+      employeeId:          employee.id,
+      employeeName:        employee.name,
+      hireDate:            employee.hireDate,
+      asOfDate:            asOf.toISOString().slice(0, 10),
+      openingBalance:      ob || null,
+      accruedSinceOpening: 0,
+      ptoUsed:             employee.ptoUsed,
+      balance:             Math.max(0, openingHours - employee.ptoUsed),
+      eligible:            eligibility.eligible,
+      daysUntilEligible:   eligibility.daysRemaining,
+      segments:            [],
+    };
+  }
+
+  // Build segments from accrualStart → asOf.
+  // yearsOfService within each segment is still measured from hireDate.
+  const boundaries     = buildSegmentBoundaries(accrualStart, employee.hoursHistory, asOf);
+  const rawSegments    = buildSegments(hire, employee.hoursHistory, boundaries);
+
+  let accruedSinceOpening = 0;
+  const segmentDetails = rawSegments.map((seg) => {
     const hoursWorked = seg.weeks * seg.avgHoursPerWeek;
     const accrual     = calculatePTOAccrual(hoursWorked, seg.yearsOfService);
 
-    totalAccrued += accrual.ptoEarned;
+    accruedSinceOpening += accrual.ptoEarned;
 
     return {
       start:            seg.start.toISOString().slice(0, 10),
@@ -335,7 +464,7 @@ function computeEmployeePTO(employee, asOfDate = new Date()) {
     };
   });
 
-  const rawBalance = totalAccrued - employee.ptoUsed;
+  const rawBalance = openingHours + accruedSinceOpening - employee.ptoUsed;
   const balance    = Math.max(0, rawBalance);
 
   return {
@@ -343,7 +472,8 @@ function computeEmployeePTO(employee, asOfDate = new Date()) {
     employeeName:        employee.name,
     hireDate:            employee.hireDate,
     asOfDate:            asOf.toISOString().slice(0, 10),
-    totalAccrued:        parseFloat(totalAccrued.toFixed(4)),
+    openingBalance:      ob || null,
+    accruedSinceOpening: parseFloat(accruedSinceOpening.toFixed(4)),
     ptoUsed:             employee.ptoUsed,
     balance:             parseFloat(balance.toFixed(4)),
     eligible:            eligibility.eligible,
@@ -433,6 +563,7 @@ function getAnniversarySummary(employee, asOfDate = new Date()) {
 
 module.exports = {
   createEmployee,
+  setOpeningBalance,
   setEmployeeHours,
   computeEmployeePTO,
   usePTO,
